@@ -1,0 +1,17 @@
+# Core agent runtime
+agent-framework-core==1.0.0b260116
+agent-framework-azure-ai==1.0.0b260116
+
+# Azure SDKs used by the redactor and reviewer
+azure-identity==1.25.1
+azure-ai-textanalytics==5.4.0
+azure-ai-documentintelligence==1.0.2
+
+# PDF text extraction and rendering
+pdfplumber==0.11.9
+pypdfium2==5.7.1
+pillow==12.2.0
+
+# Tool argument schemas / configuration
+pydantic==2.12.5
+python-dotenv==1.2.1

@@ -1,0 +1,25 @@
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Run artifacts
+output/*
+!output/.gitkeep
+samples/*
+!samples/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
