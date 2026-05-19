@@ -42,6 +42,21 @@ Categories to cover (every constituent word of each span should be marked)
 5. Standard PII identifiers
    - SSN/EIN, passport, driver's license, DOB, bank/credit card/IBAN/routing
      numbers, government IDs.
+6. Client logos, brand marks, and watermark imagery
+   - Every visible company logo, brand mark, or watermark that identifies
+     the client must be covered, whether it appears as a small inline
+     graphic (header, footer, slide corner) or as a large background
+     watermark.
+   - Use `list_visual_regions` to discover them and `redact_visual_regions`
+     to mark them. Trust the `strategy` field returned by the tool:
+     * `inline` regions are covered by a black rectangle in place.
+     * `page_split` regions are background watermarks; redacting them
+       would also obscure overlaid foreground content, so the renderer
+       automatically emits the fully blacked page followed by a clean
+       `Page N (continued)` reflow page containing only the non-redacted
+       text. Treat this as the expected behavior; do not work around it.
+   - The reviewer must call `detect_logos_on_rendered_pdf` and flag every
+     remaining graphic as `type: "Logo"`.
 
 What to leave intact
 - Generic industry commentary, market context, methodology, framework names.

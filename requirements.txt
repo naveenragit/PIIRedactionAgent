@@ -6,6 +6,7 @@ agent-framework-azure-ai==1.0.0b260116
 azure-identity==1.25.1
 azure-ai-textanalytics==5.4.0
 azure-ai-documentintelligence==1.0.2
+azure-ai-vision-imageanalysis==1.0.0
 
 # PDF text extraction and rendering
 pdfplumber==0.11.9

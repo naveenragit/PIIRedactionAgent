@@ -13,10 +13,14 @@ from agent_framework.azure import AzureOpenAIChatClient
 
 from .agent_tools import (
     apply_redactions,
+    detect_logos_on_rendered_pdf,
     detect_pii_with_language_service,
     extract_pdf_words,
+    list_visual_regions,
     read_redacted_text,
     redact_all_matching_terms,
+    redact_bbox,
+    redact_visual_regions,
 )
 
 
@@ -46,7 +50,14 @@ def build_redactor_agent(chat_client: AzureOpenAIChatClient) -> ChatAgent:
         description="Marks sensitive spans in a business document.",
         instructions=_REDACTOR_INSTRUCTIONS,
         chat_client=chat_client,
-        tools=[extract_pdf_words, redact_all_matching_terms, apply_redactions],
+        tools=[
+            extract_pdf_words,
+            redact_all_matching_terms,
+            apply_redactions,
+            list_visual_regions,
+            redact_visual_regions,
+            redact_bbox,
+        ],
     )
 
 
@@ -57,5 +68,9 @@ def build_reviewer_agent(chat_client: AzureOpenAIChatClient) -> ChatAgent:
         description="Audits a sanitized business document.",
         instructions=_REVIEWER_INSTRUCTIONS,
         chat_client=chat_client,
-        tools=[read_redacted_text, detect_pii_with_language_service],
+        tools=[
+            read_redacted_text,
+            detect_pii_with_language_service,
+            detect_logos_on_rendered_pdf,
+        ],
     )
