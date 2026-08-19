@@ -62,8 +62,13 @@ class RunContext:
     regions: list[PageRegion] = field(default_factory=list)
     redacted_region_keys: set[tuple[int, int]] = field(default_factory=set)
     page_split_pages: set[int] = field(default_factory=set)
+    # Pages that emitted a tagged supplemental page in the last render.
+    supplemental_pages: set[int] = field(default_factory=set)
     current_pdf: Path | None = None
     history: list[dict] = field(default_factory=list)
     # Auto-detected client / preparer identity. Populated by the
     # orchestrator before agent turns run.
     doc_context: "DocumentContext | None" = None
+    # Per-tool attribution counters used by the metrics module.
+    # Shape: {"tool_name": {"calls": int, "words_added": int, "regions_added": int}}.
+    tool_counters: dict[str, dict[str, int]] = field(default_factory=dict)

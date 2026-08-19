@@ -4,15 +4,15 @@ The output is a flattened raster PDF, so the original text stream is gone —
 redactions cannot be reversed via copy/paste or text extraction, and the black
 rectangles are visually unambiguous.
 
-For pages that contain a "background" logo or watermark (a large region whose
-redaction would also obscure overlaid foreground content), the renderer emits
-two pages in sequence:
+When a redacted visual region (a logo or watermark) sits behind foreground text
+that is *not* itself redacted, blacking out the region would also hide that
+legitimate text. For those pages the renderer emits two pages in sequence:
 
-1. The original page with all redactions applied (the background region is
-   blacked out, which also covers the foreground content sitting on top).
-2. A freshly synthesized "reflow" page containing only the **non-redacted**
-   foreground words, re-rendered at their original positions on a clean white
-   canvas.
+1. The original page with all redactions applied (the region is blacked out,
+   which also covers any foreground content sitting on top of it).
+2. A tagged "supplemental" page carrying only the **non-redacted** words of
+   that page, re-rendered at their original positions on a clean white canvas
+   beneath a banner identifying which page they came from.
 """
 
 from __future__ import annotations
@@ -22,7 +22,13 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from PIL import Image, ImageDraw, ImageFont
 
-from .config import REFLOW_FONT_CANDIDATES, RENDER_DPI
+from .config import (
+    REFLOW_FONT_CANDIDATES,
+    RENDER_DPI,
+    SUPPLEMENTAL_BANNER_HEIGHT_POINTS,
+    SUPPLEMENTAL_MIN_OCCLUDED_WORDS,
+    SUPPLEMENTAL_PAGE_TAG,
+)
 from .logger import log
 from .models import PageRegion, PageWord
 
@@ -96,71 +102,135 @@ def _draw_redacted_overlay(
         draw.rectangle([x0, y0, x1, y1], fill="black")
 
 
-def _page_has_page_number(
-    page_index: int,
-    page_size_points: tuple[float, float],
-    page_words: list[PageWord],
-) -> bool:
-    """Heuristic: does this page show a printed page number?
+# Above this many words per distinct text row, a page's coordinates are
+# treated as unusable for positional replay (see _layout_is_degenerate).
+_DEGENERATE_WORDS_PER_ROW = 25
 
-    Looks for a numeric token in the bottom 15% of the page whose value matches
-    the 1-based page index. Tolerates simple decorations like "5", "- 5 -",
-    "Page 5", "5/12".
+
+def _layout_is_degenerate(words: list[PageWord]) -> bool:
+    """True when word y-positions collapse onto very few rows.
+
+    Some print-to-PDF documents carry correct text in an unusable layout
+    (hundreds of words sharing one baseline). Replaying those words at their
+    original coordinates yields an illegible smear, so the supplemental page
+    reflows them into wrapped lines instead.
     """
-    _, page_height = page_size_points
-    if page_height <= 0:
+    if not words:
         return False
-    footer_threshold = page_height * 0.85
-    expected = str(page_index + 1)
+    rows = {round(word.top) for word in words}
+    return len(words) / max(1, len(rows)) > _DEGENERATE_WORDS_PER_ROW
+
+
+def _draw_wrapped_words(
+    draw: ImageDraw.ImageDraw,
+    words: list[PageWord],
+    width_px: int,
+    height_px: int,
+    start_y_px: int,
+    points_to_pixels: float,
+) -> None:
+    """Draw ``words`` in reading order as wrapped lines of body text."""
+    font_px = max(9, int(9 * points_to_pixels))
+    font = _get_font(font_px)
+    margin = int(14 * points_to_pixels)
+    line_height = int(font_px * 1.4)
+    max_width = width_px - (2 * margin)
+    bottom_limit = height_px - margin - line_height
+
+    y = start_y_px + margin
+    line: list[str] = []
+    for word in sorted(words, key=lambda w: w.index):
+        candidate = line + [word.text]
+        if line and draw.textlength(" ".join(candidate), font=font) > max_width:
+            draw.text((margin, y), " ".join(line), fill="black", font=font)
+            y += line_height
+            if y > bottom_limit:
+                return
+            line = [word.text]
+        else:
+            line = candidate
+    if line and y <= bottom_limit:
+        draw.text((margin, y), " ".join(line), fill="black", font=font)
+
+
+def _occluded_visible_words(
+    page_words: list[PageWord],
+    redacted_word_keys: set[tuple[int, int]],
+    redacted_regions: list[PageRegion],
+) -> list[PageWord]:
+    """Return non-redacted words whose bbox intersects a redacted region.
+
+    These are words that would become unreadable once the region is blacked
+    out, so they are the reason a supplemental page is needed.
+    """
+    if not redacted_regions:
+        return []
+    occluded: list[PageWord] = []
     for word in page_words:
-        if word.top < footer_threshold:
+        if (word.page, word.index) in redacted_word_keys:
             continue
-        token = word.text.strip().strip(".,;:()[]{}\"'`-/")
-        if token == expected:
-            return True
-        # "5/12" style
-        head = token.split("/", 1)[0]
-        if head == expected:
-            return True
-    return False
+        for region in redacted_regions:
+            if (
+                word.x0 < region.x1
+                and word.x1 > region.x0
+                and word.top < region.bottom
+                and word.bottom > region.top
+            ):
+                occluded.append(word)
+                break
+    return occluded
 
 
-def _render_reflow_page(
+def _render_supplemental_page(
     page_size_points: tuple[float, float],
     visible_words: list[PageWord],
     points_to_pixels: float,
-    footer_text: str,
+    banner_text: str,
 ) -> Image.Image:
-    """Build a clean white page with ``visible_words`` placed at their original bboxes."""
+    """Build a tagged white page carrying ``visible_words`` at their original bboxes.
+
+    Content is compressed vertically to sit beneath the banner strip so that no
+    word is pushed off the bottom of the page.
+    """
     width_px = max(1, int(page_size_points[0] * points_to_pixels))
     height_px = max(1, int(page_size_points[1] * points_to_pixels))
     canvas = Image.new("RGB", (width_px, height_px), "white")
     draw = ImageDraw.Draw(canvas)
 
+    banner_px = max(1, int(SUPPLEMENTAL_BANNER_HEIGHT_POINTS * points_to_pixels))
+    draw.rectangle([0, 0, width_px, banner_px], fill=(0, 0, 0))
+    banner_font = _get_font(int(banner_px * 0.55))
+    try:
+        draw.text(
+            (int(6 * points_to_pixels), int(banner_px * 0.22)),
+            banner_text,
+            fill="white",
+            font=banner_font,
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    page_height_px = max(1.0, page_size_points[1] * points_to_pixels)
+    squeeze = (page_height_px - banner_px) / page_height_px
+
+    if _layout_is_degenerate(visible_words):
+        _draw_wrapped_words(
+            draw, visible_words, width_px, height_px, banner_px, points_to_pixels
+        )
+        return canvas
+
     for word in visible_words:
         box_height_points = max(1.0, word.bottom - word.top)
         # Use ~95% of the bbox height as the font size — visually approximates
         # the original glyphs without overflowing the box.
-        font_size_pixels = int(box_height_points * points_to_pixels * 0.95)
+        font_size_pixels = int(box_height_points * points_to_pixels * 0.95 * squeeze)
         font = _get_font(font_size_pixels)
         x = word.x0 * points_to_pixels
-        y = word.top * points_to_pixels
+        y = banner_px + (word.top * points_to_pixels * squeeze)
         try:
             draw.text((x, y), word.text, fill="black", font=font)
         except Exception:  # pragma: no cover - defensive
             continue
-
-    if footer_text:
-        footer_font = _get_font(max(10, int(8 * points_to_pixels)))
-        try:
-            draw.text(
-                (10, height_px - int(14 * points_to_pixels)),
-                footer_text,
-                fill=(120, 120, 120),
-                font=footer_font,
-            )
-        except Exception:  # pragma: no cover
-            pass
 
     return canvas
 
@@ -173,7 +243,7 @@ def render_redacted_pdf(
     regions: list[PageRegion] | None = None,
     redacted_region_keys: set[tuple[int, int]] | None = None,
     page_split_pages: set[int] | None = None,
-) -> None:
+) -> set[int]:
     """Rasterize ``source_pdf`` and overlay black rectangles over redactions.
 
     Args:
@@ -184,8 +254,11 @@ def render_redacted_pdf(
         regions: Visual regions (logos / images / figures) discovered in the PDF.
         redacted_region_keys: Set of ``(page_index, region_index)`` pairs marked
             for redaction.
-        page_split_pages: Pages whose redacted regions are background watermarks;
-            each such page produces two output pages (blacked original + reflow).
+        page_split_pages: Pages already known to carry a background watermark;
+            these always produce a supplemental page.
+
+    Returns:
+        The set of 0-based source page indices that emitted a supplemental page.
     """
     regions = regions or []
     redacted_region_keys = redacted_region_keys or set()
@@ -213,6 +286,7 @@ def render_redacted_pdf(
     points_to_pixels = RENDER_DPI / 72.0
     pdf = pdfium.PdfDocument(str(source_pdf))
     page_images: list[Image.Image] = []
+    supplemental_pages: set[int] = set()
     try:
         for page_index in range(len(pdf)):
             page = pdf[page_index]
@@ -229,31 +303,36 @@ def render_redacted_pdf(
             )
             page_images.append(pil_image)
 
-            # If this page has a background logo redaction, add the reflow page.
-            if page_index in page_split_pages and page_region_redactions:
-                redacted_keys_on_page = {
-                    (page_index, w.index) for w in page_word_redactions
-                }
-                visible_words = [
-                    w
-                    for w in words_by_page.get(page_index, [])
-                    if (w.page, w.index) not in redacted_keys_on_page
-                ]
-                page_size = page.get_size()  # (width_points, height_points)
-                page_size_points = (float(page_size[0]), float(page_size[1]))
-                if _page_has_page_number(
-                    page_index, page_size_points, words_by_page.get(page_index, [])
-                ):
-                    footer_text = f"Page {page_index + 1} (continued)"
-                else:
-                    footer_text = ""
-                reflow_image = _render_reflow_page(
+            # A supplemental page is needed when a redacted region hides text
+            # that is not itself redacted.
+            all_page_words = words_by_page.get(page_index, [])
+            occluded = _occluded_visible_words(
+                all_page_words, redacted_word_keys, page_region_redactions
+            )
+            needs_supplement = bool(page_region_redactions) and (
+                page_index in page_split_pages
+                or len(occluded) >= SUPPLEMENTAL_MIN_OCCLUDED_WORDS
+            )
+            if not needs_supplement:
+                continue
+
+            visible_words = [
+                w for w in all_page_words if (w.page, w.index) not in redacted_word_keys
+            ]
+            if not visible_words:
+                continue
+
+            page_size = page.get_size()  # (width_points, height_points)
+            page_size_points = (float(page_size[0]), float(page_size[1]))
+            page_images.append(
+                _render_supplemental_page(
                     page_size_points=page_size_points,
                     visible_words=visible_words,
                     points_to_pixels=points_to_pixels,
-                    footer_text=footer_text,
+                    banner_text=SUPPLEMENTAL_PAGE_TAG.format(page=page_index + 1),
                 )
-                page_images.append(reflow_image)
+            )
+            supplemental_pages.add(page_index)
     finally:
         pdf.close()
 
@@ -267,3 +346,10 @@ def render_redacted_pdf(
         format="PDF",
         resolution=float(RENDER_DPI),
     )
+
+    if supplemental_pages:
+        log.info(
+            "Supplemental pages appended after source pages: %s",
+            sorted(p + 1 for p in supplemental_pages),
+        )
+    return supplemental_pages

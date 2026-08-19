@@ -6,6 +6,7 @@ Document Intelligence (``prebuilt-read``) for scanned/image-only PDFs.
 
 from __future__ import annotations
 
+import statistics
 from pathlib import Path
 
 import pdfplumber
@@ -13,6 +14,7 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeResult
 
 from .azure_clients import get_azure_credential, resolve_document_intelligence_endpoint
+from .config import MIN_PLAUSIBLE_WORD_HEIGHT_POINTS
 from .logger import log
 from .models import PageWord
 
@@ -81,13 +83,28 @@ def _extract_words_via_ocr(pdf_path: Path) -> tuple[list[PageWord], list[tuple[f
     return words, page_sizes
 
 
+def _text_layer_geometry_is_usable(words: list[PageWord]) -> bool:
+    """True when word boxes are large enough to redact against.
+
+    A hidden search layer reports glyph boxes around a point tall, sitting at
+    coordinates unrelated to the rendered text. Painting redactions over those
+    boxes produces invisible slivers in the wrong place, so such a layer must
+    not be trusted.
+    """
+    heights = [w.bottom - w.top for w in words]
+    if not heights:
+        return False
+    return statistics.median(heights) >= MIN_PLAUSIBLE_WORD_HEIGHT_POINTS
+
+
 def extract_words_with_bboxes(
     pdf_path: Path,
 ) -> tuple[list[PageWord], list[tuple[float, float]]]:
     """Extract word-level text + bounding boxes from a PDF.
 
     Falls back to OCR via Azure AI Document Intelligence when pdfplumber finds
-    zero words (typical for scanned/image-only PDFs).
+    zero words (scanned/image-only PDFs) or when the embedded text layer's
+    geometry is too degenerate to redact against.
     """
     words: list[PageWord] = []
     page_sizes: list[tuple[float, float]] = []
@@ -113,6 +130,17 @@ def extract_words_with_bboxes(
         log.warning(
             "pdfplumber found 0 words in %s — falling back to OCR via Azure AI Document Intelligence.",
             pdf_path.name,
+        )
+        return _extract_words_via_ocr(pdf_path)
+
+    if not _text_layer_geometry_is_usable(words):
+        median_height = statistics.median([w.bottom - w.top for w in words])
+        log.warning(
+            "%s has a degenerate text layer (median word height %.2fpt < %.1fpt); "
+            "redactions drawn against it would be misplaced. Falling back to OCR.",
+            pdf_path.name,
+            median_height,
+            MIN_PLAUSIBLE_WORD_HEIGHT_POINTS,
         )
         return _extract_words_via_ocr(pdf_path)
 

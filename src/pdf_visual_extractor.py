@@ -28,6 +28,10 @@ from .azure_clients import get_azure_credential, resolve_document_intelligence_e
 from .config import (
     BG_AREA_RATIO,
     BG_WORD_OVERLAP_THRESHOLD,
+    LOGO_DETECTION_MIN_CONFIDENCE,
+    TEMPLATE_IOU_THRESHOLD,
+    TEMPLATE_MAX_AREA_RATIO,
+    TEMPLATE_MIN_PAGES,
     VISION_ANALYSIS_DPI,
     VISION_IOU_MERGE_THRESHOLD,
     VISION_LOGO_KEYWORDS,
@@ -36,10 +40,20 @@ from .logger import log
 from .models import PageRegion, PageWord
 
 
+# Feature set negotiated once per process. Caption / DenseCaptions are only
+# available in some regions, so the richest supported set is discovered on the
+# first analyzed page and reused thereafter.
+_VISION_FEATURES: list | None = None
+
+
 def _resolve_vision_endpoint() -> str | None:
     endpoint = os.getenv("AZURE_VISION_ENDPOINT", "").strip()
     if endpoint and not endpoint.startswith("<"):
         return endpoint.rstrip("/") + "/"
+    log.warning(
+        "AZURE_VISION_ENDPOINT is not set — Azure AI Vision logo detection is "
+        "disabled; falling back to Document Intelligence figures only."
+    )
     return None
 
 
@@ -109,6 +123,45 @@ def _classify_strategy(
     return "inline"
 
 
+def _negotiate_vision_features(client, probe_image: bytes) -> list:
+    """Return the richest Image Analysis feature set this resource supports.
+
+    ``DenseCaptions`` drives the keyword-based logo matching but is only
+    offered in a subset of Azure regions; when it is unavailable the call is
+    downgraded to ``Objects`` alone rather than failing on every page.
+    """
+    global _VISION_FEATURES
+    if _VISION_FEATURES is not None:
+        return _VISION_FEATURES
+
+    from azure.ai.vision.imageanalysis.models import VisualFeatures
+
+    candidates = [
+        [VisualFeatures.OBJECTS, VisualFeatures.DENSE_CAPTIONS],
+        [VisualFeatures.OBJECTS],
+    ]
+    for features in candidates:
+        try:
+            client.analyze(image_data=probe_image, visual_features=features)
+        except Exception as exc:  # pragma: no cover - service-side
+            log.warning(
+                "Vision feature set %s unavailable: %s",
+                [str(f) for f in features],
+                str(exc).splitlines()[0][:120],
+            )
+            continue
+        if len(features) == 1:
+            log.warning(
+                "Vision running WITHOUT DenseCaptions (region limitation); "
+                "logo recall from this source will be limited."
+            )
+        _VISION_FEATURES = features
+        return features
+
+    _VISION_FEATURES = []
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Azure AI Vision Image Analysis
 # ---------------------------------------------------------------------------
@@ -129,7 +182,6 @@ def _vision_logo_detections(
     # Lazy import so the SDK is optional.
     try:
         from azure.ai.vision.imageanalysis import ImageAnalysisClient
-        from azure.ai.vision.imageanalysis.models import VisualFeatures
     except ImportError:  # pragma: no cover
         log.warning("azure-ai-vision-imageanalysis not installed; skipping Vision logo detection.")
         return {}
@@ -152,9 +204,17 @@ def _vision_logo_detections(
                 pil_image.save(buf, format="JPEG", quality=85)
                 image_bytes = buf.getvalue()
 
+                features = _negotiate_vision_features(client, image_bytes)
+                if not features:
+                    log.warning(
+                        "Vision Image Analysis unusable for this resource; "
+                        "skipping Vision logo detection entirely."
+                    )
+                    break
+
                 result = client.analyze(
                     image_data=image_bytes,
-                    visual_features=[VisualFeatures.OBJECTS, VisualFeatures.DENSE_CAPTIONS],
+                    visual_features=features,
                 )
             except Exception as exc:  # pragma: no cover - service-side
                 log.warning("Vision analyze failed on page %d: %s", page_index, exc)
@@ -175,6 +235,8 @@ def _vision_logo_detections(
                             matched_conf = max(matched_conf, float(getattr(tag, "confidence", 0.0)))
                     if matched_label is None:
                         continue
+                    if matched_conf < LOGO_DETECTION_MIN_CONFIDENCE:
+                        continue
                     box = getattr(obj, "bounding_box", None)
                     if box is None:
                         continue
@@ -191,6 +253,8 @@ def _vision_logo_detections(
                     if not any(k in text for k in keywords):
                         continue
                     conf = float(getattr(cap, "confidence", 0.0))
+                    if conf < LOGO_DETECTION_MIN_CONFIDENCE:
+                        continue
                     box = getattr(cap, "bounding_box", None)
                     if box is None:
                         continue
@@ -209,6 +273,107 @@ def _vision_logo_detections(
         total = sum(len(v) for v in detections.values())
         log.info("Vision logo detections: %d hits across %d pages", total, len(detections))
     return detections
+
+
+def _propagate_template_regions(
+    regions: list[PageRegion],
+    page_sizes: list[tuple[float, float]],
+    words_by_page: dict[int, list[PageWord]],
+) -> list[PageRegion]:
+    """Replicate repeated small marks onto pages where detection missed them.
+
+    Detection reports a logo only on the pages where it happens to be found,
+    which leaves gaps on visually identical pages. Small boxes that recur at
+    the same coordinates on at least ``TEMPLATE_MIN_PAGES`` pages are treated
+    as template chrome and stamped onto every remaining page.
+    """
+    if not regions or not page_sizes:
+        return []
+
+    # Only small marks are eligible; large figures must never be replicated.
+    candidates: list[PageRegion] = []
+    for region in regions:
+        page_w, page_h = page_sizes[region.page]
+        page_area = page_w * page_h
+        if page_area <= 0:
+            continue
+        area = max(0.0, region.x1 - region.x0) * max(0.0, region.bottom - region.top)
+        if area / page_area <= TEMPLATE_MAX_AREA_RATIO:
+            candidates.append(region)
+    if not candidates:
+        return []
+
+    # Greedy clustering of boxes that land at the same spot on different pages.
+    clusters: list[list[PageRegion]] = []
+    for region in candidates:
+        box = (region.x0, region.top, region.x1, region.bottom)
+        for cluster in clusters:
+            head = cluster[0]
+            if _bbox_iou(box, (head.x0, head.top, head.x1, head.bottom)) >= TEMPLATE_IOU_THRESHOLD:
+                cluster.append(region)
+                break
+        else:
+            clusters.append([region])
+
+    next_index_by_page: dict[int, int] = {}
+    for region in regions:
+        next_index_by_page[region.page] = max(
+            next_index_by_page.get(region.page, 0), region.index + 1
+        )
+
+    added: list[PageRegion] = []
+    for cluster in clusters:
+        covered_pages = {r.page for r in cluster}
+        if len(covered_pages) < TEMPLATE_MIN_PAGES:
+            continue
+
+        # Average the cluster to a stable representative box.
+        count = len(cluster)
+        rep = (
+            sum(r.x0 for r in cluster) / count,
+            sum(r.top for r in cluster) / count,
+            sum(r.x1 for r in cluster) / count,
+            sum(r.bottom for r in cluster) / count,
+        )
+        label = next((r.label for r in cluster if r.label), None)
+
+        for page_index in range(len(page_sizes)):
+            if page_index in covered_pages:
+                continue
+            already = any(
+                _bbox_iou(rep, (r.x0, r.top, r.x1, r.bottom)) >= TEMPLATE_IOU_THRESHOLD
+                for r in regions
+                if r.page == page_index
+            )
+            if already:
+                continue
+            new_index = next_index_by_page.get(page_index, 0)
+            next_index_by_page[page_index] = new_index + 1
+            added.append(
+                PageRegion(
+                    page=page_index,
+                    index=new_index,
+                    kind="logo",
+                    x0=rep[0],
+                    top=rep[1],
+                    x1=rep[2],
+                    bottom=rep[3],
+                    confidence=min(r.confidence for r in cluster),
+                    label=label or "template-logo",
+                    strategy=_classify_strategy(
+                        rep, page_sizes[page_index], words_by_page.get(page_index, [])
+                    ),
+                )
+            )
+
+    if added:
+        log.info(
+            "Template propagation: +%d regions across %d pages (from %d repeated marks)",
+            len(added),
+            len({r.page for r in added}),
+            sum(1 for c in clusters if len({r.page for r in c}) >= TEMPLATE_MIN_PAGES),
+        )
+    return added
 
 
 def extract_visual_regions(
@@ -313,6 +478,8 @@ def extract_visual_regions(
                     strategy=strategy,
                 )
             )
+
+    regions.extend(_propagate_template_regions(regions, page_sizes, words_by_page))
 
     log.info(
         "Visual region extraction: %d regions across %d pages (page_split=%d)",

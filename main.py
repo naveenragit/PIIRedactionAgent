@@ -27,6 +27,25 @@ def parse_args() -> argparse.Namespace:
         default=str(SAMPLES_DIR / DEFAULT_INPUT_FILENAME),
         help="Path to input PDF.",
     )
+    parser.add_argument(
+        "--run-label",
+        default=None,
+        help=(
+            "Short tag for this run (e.g. 'old-prompt', 'new-prompt-v2'). "
+            "Used in the per-run metrics filename and the runs_summary.csv "
+            "row so you can compare prompt revisions side-by-side."
+        ),
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help=(
+            "Cap the redactor/reviewer loop to this many iterations. Use 1 for a "
+            "single-pass baseline run (the minimum is clamped to match). "
+            "Defaults to the configured maximum."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -43,7 +62,13 @@ def main() -> None:
         )
         sys.exit(2)
 
-    audit = asyncio.run(run_redaction_loop(input_pdf))
+    audit = asyncio.run(
+        run_redaction_loop(
+            input_pdf,
+            run_label=args.run_label,
+            max_iterations=args.max_iterations,
+        )
+    )
 
     print("\n" + "=" * 70)
     print("DONE")
@@ -52,6 +77,10 @@ def main() -> None:
     print(f"Iterations:  {audit['iterations_run']}")
     print(f"Verdict:     {audit['final_verdict'].get('verdict')}")
     print(f"Audit trail: {OUTPUT_DIR / 'audit_trail.json'}")
+    if audit.get("metrics_path"):
+        print(f"Metrics:     {audit['metrics_path']}")
+    if audit.get("metrics_summary_csv"):
+        print(f"Summary CSV: {audit['metrics_summary_csv']}")
 
 
 if __name__ == "__main__":

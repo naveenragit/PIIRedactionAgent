@@ -26,7 +26,68 @@ from .logger import log
 from .models import PageRegion
 from .pdf_renderer import render_redacted_pdf
 from .pdf_visual_extractor import detect_remaining_logos
-from .redaction_state import build_redacted_text_view, get_active_context
+from .redaction_state import build_redacted_text_view, get_active_context, record_tool_use
+
+
+def _loads_spans_tolerant(raw: str, tool_name: str) -> tuple[object | None, int]:
+    """Parse a span payload, salvaging model output that was cut off mid-array.
+
+    Large tool-call arguments get truncated by the model's output limit, which
+    would otherwise discard an entire batch of valid redactions. Returns the
+    parsed value plus the number of characters dropped during salvage.
+    """
+    try:
+        return json.loads(raw), 0
+    except json.JSONDecodeError:
+        pass
+
+    # Walk the payload tracking brace depth (ignoring braces inside strings) to
+    # find the end of the last complete top-level object.
+    depth = 0
+    in_string = False
+    escaped = False
+    last_complete = -1
+    for position, char in enumerate(raw):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                last_complete = position
+
+    if last_complete < 0:
+        return None, 0
+
+    head = raw.lstrip()
+    repaired = raw[: last_complete + 1]
+    if head.startswith("["):
+        repaired += "]"
+
+    try:
+        salvaged = json.loads(repaired)
+    except json.JSONDecodeError:
+        return None, 0
+
+    dropped = max(0, len(raw) - (last_complete + 1))
+    log.warning(
+        "%s: payload was truncated; salvaged %d complete entr%s and dropped %d trailing chars.",
+        tool_name,
+        len(salvaged) if isinstance(salvaged, list) else 1,
+        "y" if isinstance(salvaged, list) and len(salvaged) == 1 else "ies",
+        dropped,
+    )
+    return salvaged, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +140,9 @@ def apply_redactions(
         Field(
             description=(
                 'JSON list like [{"page":0,"word_indices":[3,4,5,12]}, ...]. '
-                "Indices come from extract_pdf_words."
+                "Indices come from extract_pdf_words. Keep each call to at "
+                "most ~10 pages and split larger sets across several calls — "
+                "long payloads get truncated in transit and lose redactions."
             )
         ),
     ],
@@ -91,11 +154,19 @@ def apply_redactions(
     context = get_active_context()
     log.debug("apply_redactions called with %d bytes", len(spans_json))
 
-    try:
-        spans = json.loads(spans_json)
-    except json.JSONDecodeError as exc:
-        log.error("apply_redactions: invalid JSON: %s | head=%r", exc, spans_json[:200])
-        return json.dumps({"error": f"invalid JSON: {exc}"})
+    spans, _ = _loads_spans_tolerant(spans_json, "apply_redactions")
+    if spans is None:
+        log.error("apply_redactions: unparseable JSON | head=%r", spans_json[:200])
+        return json.dumps(
+            {
+                "error": "invalid JSON",
+                "hint": (
+                    "The payload could not be parsed, most likely because it was "
+                    "too long and got cut off. Resend in smaller batches of at "
+                    "most 10 pages per call."
+                ),
+            }
+        )
 
     # Be tolerant of agents that wrap the list in a dict like {"spans":[...]}.
     if isinstance(spans, dict):
@@ -140,7 +211,7 @@ def apply_redactions(
                 added += 1
 
     output_path = OUTPUT_DIR / f"iteration_{context.iteration}_redacted.pdf"
-    render_redacted_pdf(
+    context.supplemental_pages = render_redacted_pdf(
         source_pdf=context.input_pdf,
         words=context.words,
         redacted_word_keys=context.redacted_word_keys,
@@ -151,6 +222,7 @@ def apply_redactions(
     )
     context.current_pdf = output_path
 
+    record_tool_use("apply_redactions", words_added=added)
     log.info(
         "apply_redactions: added=%d total=%d invalid=%d -> %s",
         added,
@@ -240,7 +312,7 @@ def redact_all_matching_terms(
                     match_counts_by_term[label] = match_counts_by_term.get(label, 0) + 1
 
     output_path = OUTPUT_DIR / f"iteration_{context.iteration}_redacted.pdf"
-    render_redacted_pdf(
+    context.supplemental_pages = render_redacted_pdf(
         source_pdf=context.input_pdf,
         words=context.words,
         redacted_word_keys=context.redacted_word_keys,
@@ -251,6 +323,7 @@ def redact_all_matching_terms(
     )
     context.current_pdf = output_path
 
+    record_tool_use("redact_all_matching_terms", words_added=added)
     log.info(
         "redact_all_matching_terms: terms=%d added=%d total=%d -> %s",
         len(term_token_lists),
@@ -345,11 +418,15 @@ def redact_visual_regions(
     """Mark the listed visual regions for redaction and rebuild the visual PDF."""
     context = get_active_context()
 
-    try:
-        spans = json.loads(spans_json)
-    except json.JSONDecodeError as exc:
-        log.error("redact_visual_regions: invalid JSON: %s | head=%r", exc, spans_json[:200])
-        return json.dumps({"error": f"invalid JSON: {exc}"})
+    spans, _ = _loads_spans_tolerant(spans_json, "redact_visual_regions")
+    if spans is None:
+        log.error("redact_visual_regions: unparseable JSON | head=%r", spans_json[:200])
+        return json.dumps(
+            {
+                "error": "invalid JSON",
+                "hint": "Payload may have been cut off. Resend in smaller batches.",
+            }
+        )
 
     if isinstance(spans, dict):
         for key in ("spans", "regions", "items", "data"):
@@ -398,7 +475,7 @@ def redact_visual_regions(
                         page_split_added.add(page)
 
     output_path = OUTPUT_DIR / f"iteration_{context.iteration}_redacted.pdf"
-    render_redacted_pdf(
+    context.supplemental_pages = render_redacted_pdf(
         source_pdf=context.input_pdf,
         words=context.words,
         redacted_word_keys=context.redacted_word_keys,
@@ -409,6 +486,7 @@ def redact_visual_regions(
     )
     context.current_pdf = output_path
 
+    record_tool_use("redact_visual_regions", regions_added=added)
     log.info(
         "redact_visual_regions: added=%d total=%d invalid=%d page_split_added=%s -> %s",
         added,
@@ -451,11 +529,15 @@ def redact_bbox(
     """
     context = get_active_context()
 
-    try:
-        spans = json.loads(spans_json)
-    except json.JSONDecodeError as exc:
-        log.error("redact_bbox: invalid JSON: %s | head=%r", exc, spans_json[:200])
-        return json.dumps({"error": f"invalid JSON: {exc}"})
+    spans, _ = _loads_spans_tolerant(spans_json, "redact_bbox")
+    if spans is None:
+        log.error("redact_bbox: unparseable JSON | head=%r", spans_json[:200])
+        return json.dumps(
+            {
+                "error": "invalid JSON",
+                "hint": "Payload may have been cut off. Resend in smaller batches.",
+            }
+        )
 
     if isinstance(spans, dict):
         for key in ("spans", "boxes", "items", "data", "missed"):
@@ -537,7 +619,7 @@ def redact_bbox(
 
     if added:
         output_path = OUTPUT_DIR / f"iteration_{context.iteration}_redacted.pdf"
-        render_redacted_pdf(
+        context.supplemental_pages = render_redacted_pdf(
             source_pdf=context.input_pdf,
             words=context.words,
             redacted_word_keys=context.redacted_word_keys,
@@ -551,6 +633,7 @@ def redact_bbox(
     else:
         output_str = str(context.current_pdf) if context.current_pdf else ""
 
+    record_tool_use("redact_bbox", regions_added=added)
     log.info(
         "redact_bbox: added=%d total_regions=%d invalid=%d",
         added,
@@ -658,6 +741,31 @@ def detect_logos_on_rendered_pdf(
         log.info("detect_logos_on_rendered_pdf -> 0 findings")
         return json.dumps({"findings": [], "count": 0})
 
+    # Findings are indexed against the rendered PDF, which interleaves
+    # supplemental pages. Translate back to source page indices so the
+    # redactor's (page, bbox) pairs address the right page.
+    page_map = _rendered_to_source_pages(context)
+    remapped: list[dict] = []
+    dropped_synthetic = 0
+    for finding in findings:
+        try:
+            rendered_page = int(finding.get("page"))
+        except (TypeError, ValueError):
+            remapped.append(finding)
+            continue
+        source_page = page_map.get(rendered_page, rendered_page)
+        if source_page is None:
+            dropped_synthetic += 1
+            continue
+        finding["page"] = source_page
+        remapped.append(finding)
+    if dropped_synthetic:
+        log.info(
+            "detect_logos_on_rendered_pdf: dropped %d finding(s) on supplemental pages",
+            dropped_synthetic,
+        )
+    findings = remapped
+
     preparer_terms = _preparer_identity_terms(context)
     skipped_dedupe = 0
     skipped_label = 0
@@ -672,10 +780,9 @@ def detect_logos_on_rendered_pdf(
                 (region.x0, region.top, region.x1, region.bottom)
             )
 
-    # Words by page for the OCR-style preparer text check. Only safe when
-    # the original page indices line up with the rendered PDF — i.e. no
-    # page_split continuation pages have been inserted.
-    page_indices_aligned = not context.page_split_pages
+    # Words by page for the OCR-style preparer text check. Page indices are
+    # realigned to source space above, so this is always safe.
+    page_indices_aligned = True
     words_by_page: dict[int, list] = {}
     if page_indices_aligned and preparer_terms:
         for w in context.words:
@@ -731,6 +838,23 @@ def detect_logos_on_rendered_pdf(
 
     log.info("detect_logos_on_rendered_pdf -> %d findings", len(kept))
     return json.dumps({"findings": kept, "count": len(kept)})
+
+
+def _rendered_to_source_pages(context) -> dict[int, int | None]:
+    """Map rendered PDF page index to source page index.
+
+    Supplemental pages are synthetic and map to ``None`` so findings landing on
+    them can be discarded rather than misattributed to a real page.
+    """
+    mapping: dict[int, int | None] = {}
+    rendered = 0
+    for source_page in range(len(context.page_sizes)):
+        mapping[rendered] = source_page
+        rendered += 1
+        if source_page in context.supplemental_pages:
+            mapping[rendered] = None
+            rendered += 1
+    return mapping
 
 
 def _preparer_identity_terms(context) -> list[str]:

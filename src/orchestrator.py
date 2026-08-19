@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 from .agents import build_redactor_agent, build_reviewer_agent
@@ -11,10 +12,19 @@ from .azure_clients import build_chat_client
 from .config import MAX_ITERATIONS, MIN_ITERATIONS, OUTPUT_DIR
 from .document_context import DocumentContext, detect_document_context
 from .logger import log
+from .metrics import (
+    append_runs_summary_csv,
+    compute_run_metrics,
+    count_missed_by_type,
+    diff_tool_counters,
+    format_metrics_table,
+    snapshot_tool_counters,
+    write_run_metrics,
+)
 from .models import RunContext
 from .pdf_text_extractor import extract_words_with_bboxes
 from .pdf_visual_extractor import extract_visual_regions
-from .redaction_policy import CUSTOM_REDACTION_RULES
+from .redaction_policy import CUSTOM_REDACTION_RULES, REDACTOR_POLICY
 from .redaction_state import set_active_context
 
 
@@ -209,8 +219,20 @@ def parse_reviewer_verdict(text: str) -> dict:
     }
 
 
-async def run_redaction_loop(input_pdf: Path) -> dict:
+async def run_redaction_loop(
+    input_pdf: Path,
+    run_label: str | None = None,
+    max_iterations: int | None = None,
+) -> dict:
     """Run the redactor/reviewer loop end-to-end and return the audit trail."""
+    started_at = datetime.now()
+
+    # Resolve iteration bounds. Callers (e.g. the --max-iterations CLI flag) can
+    # cap the loop for quick baseline runs; min is clamped so it never exceeds
+    # max. Pass max_iterations=1 to run a single pass.
+    max_iters = max(1, max_iterations) if max_iterations is not None else MAX_ITERATIONS
+    min_iters = min(MIN_ITERATIONS, max_iters)
+
     words, page_sizes = extract_words_with_bboxes(input_pdf)
     regions = extract_visual_regions(input_pdf, words, page_sizes)
     context = RunContext(
@@ -248,16 +270,16 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
     prev_missed_count: int | None = None
     stall_streak = 0
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
+    for iteration in range(1, max_iters + 1):
         context.iteration = iteration
-        log.info("--- Iteration %d/%d ---", iteration, MAX_ITERATIONS)
+        log.info("--- Iteration %d/%d ---", iteration, max_iters)
 
         # ---- Redactor turn ----
         if iteration == 1:
             redactor_prompt = _REDACTOR_FIRST_TURN_TEMPLATE.format(
                 input_pdf=context.input_pdf,
                 document_context=doc_context_block,
-                policy=CUSTOM_REDACTION_RULES.strip(),
+                policy=REDACTOR_POLICY.strip(),
                 seed_step=_render_seed_step(doc_context),
             )
         else:
@@ -269,10 +291,14 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
 
         redactions_before = len(context.redacted_word_keys)
         regions_before = len(context.redacted_region_keys)
+        tool_counters_before = snapshot_tool_counters(context)
         redactor_result = await redactor.run(redactor_prompt)
         redactor_text = str(redactor_result)
         word_delta = len(context.redacted_word_keys) - redactions_before
         region_delta = len(context.redacted_region_keys) - regions_before
+        tool_delta = diff_tool_counters(
+            tool_counters_before, snapshot_tool_counters(context)
+        )
         total_delta = word_delta + region_delta
         if total_delta == 0:
             zero_delta_streak += 1
@@ -301,7 +327,9 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
 
         verdict = parse_reviewer_verdict(reviewer_text)
         last_verdict = verdict
-        missed_count = len(verdict.get("missed", []))
+        missed_list = verdict.get("missed", []) or []
+        missed_count = len(missed_list)
+        missed_by_type = count_missed_by_type(missed_list)
         log.info(
             "Reviewer verdict: %s (missed=%d)",
             verdict.get("verdict"),
@@ -322,10 +350,13 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
                 "total_redactions": len(context.redacted_word_keys),
                 "total_regions_redacted": len(context.redacted_region_keys),
                 "page_split_pages": sorted(context.page_split_pages),
+                "supplemental_pages": sorted(p + 1 for p in context.supplemental_pages),
                 "verdict": verdict.get("verdict"),
                 "missed_count": missed_count,
+                "missed_by_type": missed_by_type,
                 "redactor_word_delta": word_delta,
                 "redactor_region_delta": region_delta,
+                "redactor_by_tool_delta": tool_delta,
                 "feedback": verdict.get("feedback", ""),
             }
         )
@@ -337,12 +368,12 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
             f"total_redactions={len(context.redacted_word_keys)}"
         )
 
-        if approved and iteration >= MIN_ITERATIONS:
-            print(f"[Loop] APPROVED at iteration {iteration} (>= min {MIN_ITERATIONS}). Exiting.")
+        if approved and iteration >= min_iters:
+            print(f"[Loop] APPROVED at iteration {iteration} (>= min {min_iters}). Exiting.")
             break
-        if approved and iteration < MIN_ITERATIONS:
+        if approved and iteration < min_iters:
             print(
-                f"[Loop] APPROVED but iteration {iteration} < min {MIN_ITERATIONS}. "
+                f"[Loop] APPROVED but iteration {iteration} < min {min_iters}. "
                 "Forcing another pass."
             )
             feedback_for_redactor = json.dumps(
@@ -358,14 +389,14 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
             )
             last_logo_bbox_block = ""
             continue
-        if stall_streak >= 2 and iteration >= MIN_ITERATIONS:
+        if stall_streak >= 2 and iteration >= min_iters:
             print(
                 f"[Loop] Convergence stalled for {stall_streak} iterations "
                 f"(no new redactions, missed count not decreasing). Stopping."
             )
             break
-        if iteration == MAX_ITERATIONS:
-            print(f"[Loop] Reached max_iterations ({MAX_ITERATIONS}). Stopping with last result.")
+        if iteration == max_iters:
+            print(f"[Loop] Reached max_iterations ({max_iters}). Stopping with last result.")
             break
 
         feedback_for_redactor = json.dumps(
@@ -380,20 +411,51 @@ async def run_redaction_loop(input_pdf: Path) -> dict:
     # Copy the latest iteration to a stable filename.
     final_pdf_path = OUTPUT_DIR / "final_redacted.pdf"
     if context.current_pdf and context.current_pdf.exists():
-        final_pdf_path.write_bytes(context.current_pdf.read_bytes())
+        try:
+            final_pdf_path.write_bytes(context.current_pdf.read_bytes())
+        except PermissionError:
+            # Usually the previous output is still open in a PDF viewer. Fall
+            # back to a timestamped name so the run's work is not lost.
+            final_pdf_path = OUTPUT_DIR / f"final_redacted_{started_at:%Y%m%d-%H%M%S}.pdf"
+            final_pdf_path.write_bytes(context.current_pdf.read_bytes())
+            log.warning(
+                "final_redacted.pdf is locked (open in a viewer?); wrote %s instead.",
+                final_pdf_path.name,
+            )
 
     audit = {
         "input_pdf": str(context.input_pdf),
         "final_pdf": str(final_pdf_path) if final_pdf_path.exists() else None,
         "iterations_run": context.iteration,
-        "min_iterations": MIN_ITERATIONS,
-        "max_iterations": MAX_ITERATIONS,
+        "min_iterations": min_iters,
+        "max_iterations": max_iters,
         "total_redactions": len(context.redacted_word_keys),
         "total_regions_redacted": len(context.redacted_region_keys),
         "page_split_pages": sorted(context.page_split_pages),
+        "supplemental_pages": sorted(p + 1 for p in context.supplemental_pages),
         "document_context": doc_context.to_dict(),
         "final_verdict": last_verdict,
         "history": context.history,
     }
     (OUTPUT_DIR / "audit_trail.json").write_text(json.dumps(audit, indent=2))
+
+    finished_at = datetime.now()
+    effective_label = run_label or started_at.strftime("%Y%m%d-%H%M%S")
+    metrics = compute_run_metrics(
+        context,
+        audit,
+        run_label=effective_label,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+    metrics_path = write_run_metrics(metrics)
+    summary_csv_path = append_runs_summary_csv(metrics)
+    audit["metrics_path"] = str(metrics_path)
+    audit["metrics_summary_csv"] = str(summary_csv_path)
+    audit["metrics"] = metrics
+
+    print("\n" + format_metrics_table(metrics))
+    print(f"\nPer-run metrics JSON: {metrics_path}")
+    print(f"Summary CSV (append): {summary_csv_path}")
+
     return audit

@@ -104,6 +104,14 @@ Drop your input PDF at `samples/sample_input.pdf` (or pass an explicit path):
 python main.py --input "samples/your-pitch-deck.pdf"
 ```
 
+To tag a run for prompt A/B comparison, pass `--run-label`:
+
+```powershell
+python main.py --input "samples/your-pitch-deck.pdf" --run-label "old-prompt"
+# ...edit the redactor / reviewer prompt...
+python main.py --input "samples/your-pitch-deck.pdf" --run-label "new-prompt-v2"
+```
+
 Artifacts written to `output/`:
 
 | File | Description |
@@ -111,9 +119,44 @@ Artifacts written to `output/`:
 | `iteration_<N>_redacted.pdf` | Redacted PDF after each pass (1..N) |
 | `final_redacted.pdf` | Copy of the last iteration's PDF |
 | `audit_trail.json` | Full run log: per-iteration verdicts, missed items, totals |
+| `metrics/run_<timestamp>_<label>.json` | Detailed per-run metrics (see below) |
+| `metrics/runs_summary.csv` | One row per run, appended in chronological order |
 
 The orchestration enforces **min 2 / max 5** iterations. Adjust in
 [src/config.py](src/config.py) (`MIN_ITERATIONS`, `MAX_ITERATIONS`).
+
+---
+
+## Comparing prompt versions (metrics)
+
+Every run writes:
+
+- a detailed JSON file at
+  `output/metrics/run_<timestamp>_<label>.json`, and
+- a single appended row to `output/metrics/runs_summary.csv`.
+
+Use `--run-label` to give each run a memorable tag (defaults to the run
+timestamp). Open `runs_summary.csv` in Excel to compare runs side-by-side.
+
+What gets counted:
+
+- **Totals** — words and visual regions redacted across the whole run.
+- **Redactor catches by source** — words/regions caught *proactively* on
+  iteration 1 (no reviewer guidance yet) vs. *reviewer-driven* (added on
+  iterations 2+ in response to reviewer feedback). A prompt revision that
+  raises the proactive share and lowers the reviewer-driven share is doing
+  more work up-front.
+- **Redactor catches by tool** — words via `redact_all_matching_terms`
+  (client-identity sweeps) vs. `apply_redactions` (per-page PII/MNPI
+  spans); regions via `redact_visual_regions` (logos discovered up-front)
+  vs. `redact_bbox` (logos the reviewer pointed at).
+- **Reviewer misses flagged** — count of items the reviewer flagged as
+  missed, bucketed by canonical type (`PII`, `MNPI`, `Logo`,
+  `Consistency`, `Structure`, `Other`), both across all iterations and at
+  the final iteration. Fewer total flags + fewer final flags = better
+  prompt.
+
+A short summary table is also printed to stdout at the end of every run.
 
 ---
 

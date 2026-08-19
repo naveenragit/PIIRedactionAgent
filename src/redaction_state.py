@@ -25,6 +25,23 @@ def get_active_context() -> RunContext:
     return _active_context
 
 
+def record_tool_use(
+    tool_name: str,
+    *,
+    words_added: int = 0,
+    regions_added: int = 0,
+) -> None:
+    """Record a redactor tool's contribution toward total redactions for metrics."""
+    context = get_active_context()
+    counters = context.tool_counters.setdefault(
+        tool_name,
+        {"calls": 0, "words_added": 0, "regions_added": 0},
+    )
+    counters["calls"] += 1
+    counters["words_added"] += int(words_added)
+    counters["regions_added"] += int(regions_added)
+
+
 def build_redacted_text_view() -> str:
     """Reconstruct the visible document text after applying current redactions.
 
